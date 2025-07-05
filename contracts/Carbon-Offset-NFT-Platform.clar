@@ -256,3 +256,167 @@
         (ok true)
     )
 )
+
+(define-data-var last-bundle-id uint u0)
+
+(define-map bundle-registry uint {
+    creator: principal,
+    name: (string-ascii 50),
+    total-carbon-amount: uint,
+    total-price: uint,
+    token-ids: (list 20 uint),
+    created-at: uint,
+    active: bool
+})
+
+(define-map bundle-ownership uint principal)
+
+(define-constant ERR-BUNDLE-NOT-FOUND (err u450))
+(define-constant ERR-BUNDLE-INACTIVE (err u451))
+(define-constant ERR-BUNDLE-LIMIT-EXCEEDED (err u452))
+(define-constant ERR-BUNDLE-EMPTY (err u453))
+(define-constant ERR-NOT-BUNDLE-OWNER (err u454))
+
+(define-read-only (get-bundle-details (bundle-id uint))
+    (map-get? bundle-registry bundle-id)
+)
+
+(define-read-only (get-bundle-owner (bundle-id uint))
+    (map-get? bundle-ownership bundle-id)
+)
+
+(define-read-only (get-last-bundle-id)
+    (var-get last-bundle-id)
+)
+
+(define-public (create-bundle 
+    (name (string-ascii 50))
+    (token-ids (list 20 uint))
+)
+    (let (
+        (bundle-id (+ (var-get last-bundle-id) u1))
+        (total-carbon (fold calculate-bundle-carbon token-ids u0))
+        (total-price (fold calculate-bundle-price token-ids u0))
+    )
+        (asserts! (> (len token-ids) u0) ERR-BUNDLE-EMPTY)
+        (asserts! (<= (len token-ids) u20) ERR-BUNDLE-LIMIT-EXCEEDED)
+        (asserts! (check-token-ownership token-ids) ERR-NOT-AUTHORIZED)
+        
+        (map-set bundle-registry bundle-id {
+            creator: tx-sender,
+            name: name,
+            total-carbon-amount: total-carbon,
+            total-price: total-price,
+            token-ids: token-ids,
+            created-at: stacks-block-height,
+            active: true
+        })
+        
+        (map-set bundle-ownership bundle-id tx-sender)
+        (var-set last-bundle-id bundle-id)
+        (ok bundle-id)
+    )
+)
+
+(define-public (purchase-bundle (bundle-id uint))
+    (let (
+        (bundle-info (unwrap! (map-get? bundle-registry bundle-id) ERR-BUNDLE-NOT-FOUND))
+        (bundle-owner (unwrap! (map-get? bundle-ownership bundle-id) ERR-BUNDLE-NOT-FOUND))
+        (total-price (get total-price bundle-info))
+        (fee (/ (* total-price (var-get platform-fee)) u10000))
+        (buyer-stats (get-user-stats tx-sender))
+    )
+        (asserts! (get active bundle-info) ERR-BUNDLE-INACTIVE)
+        (asserts! (not (is-eq tx-sender bundle-owner)) ERR-NOT-AUTHORIZED)
+    
+        (try! (stx-transfer? (- total-price fee) tx-sender bundle-owner))
+        (try! (stx-transfer? fee tx-sender (var-get contract-owner)))
+        
+        (try! (transfer-bundle-tokens (get token-ids bundle-info) bundle-owner tx-sender))
+        
+        (map-set bundle-ownership bundle-id tx-sender)
+        (map-set user-stats tx-sender {
+            total-purchased: (+ (get total-purchased buyer-stats) (len (get token-ids bundle-info))),
+            total-retired: (get total-retired buyer-stats),
+            total-spent: (+ (get total-spent buyer-stats) total-price)
+        })
+        
+        (ok true)
+    )
+)
+
+(define-public (retire-bundle (bundle-id uint))
+    (let (
+        (bundle-info (unwrap! (map-get? bundle-registry bundle-id) ERR-BUNDLE-NOT-FOUND))
+        (bundle-owner (unwrap! (map-get? bundle-ownership bundle-id) ERR-BUNDLE-NOT-FOUND))
+    )
+        (asserts! (is-eq tx-sender bundle-owner) ERR-NOT-BUNDLE-OWNER)
+        (asserts! (get active bundle-info) ERR-BUNDLE-INACTIVE)
+        
+        (try! (retire-bundle-tokens (get token-ids bundle-info)))
+        
+        (map-set bundle-registry bundle-id 
+            (merge bundle-info {active: false})
+        )
+        
+        (ok true)
+    )
+)
+
+(define-private (calculate-bundle-carbon (token-id uint) (acc uint))
+    (match (map-get? offset-details token-id)
+        offset-info (+ acc (get carbon-amount offset-info))
+        acc
+    )
+)
+
+(define-private (calculate-bundle-price (token-id uint) (acc uint))
+    (match (map-get? offset-details token-id)
+        offset-info (+ acc (get price offset-info))
+        acc
+    )
+)
+
+(define-private (check-token-ownership (token-ids (list 20 uint)))
+    (fold check-single-token-ownership token-ids true)
+)
+
+(define-private (check-single-token-ownership (token-id uint) (acc bool))
+    (and acc (is-eq (some tx-sender) (nft-get-owner? carbon-offset-nft token-id)))
+)
+
+(define-private (transfer-bundle-tokens (token-ids (list 20 uint)) (from principal) (to principal))
+    (let (
+        (result (fold transfer-single-token token-ids {from: from, to: to, success: true}))
+    )
+        (if (get success result)
+            (ok true)
+            ERR-NOT-AUTHORIZED
+        )
+    )
+)
+
+(define-private (transfer-single-token (token-id uint) (transfer-data {from: principal, to: principal, success: bool}))
+    (if (get success transfer-data)
+        (match (nft-transfer? carbon-offset-nft token-id (get from transfer-data) (get to transfer-data))
+            success transfer-data
+            error (merge transfer-data {success: false})
+        )
+        transfer-data
+    )
+)
+
+(define-private (retire-bundle-tokens (token-ids (list 20 uint)))
+    (let (
+        (result (fold retire-single-bundle-token token-ids true))
+    )
+        (if result
+            (ok true)
+            ERR-NOT-AUTHORIZED
+        )
+    )
+)
+
+(define-private (retire-single-bundle-token (token-id uint) (acc bool))
+    (and acc (is-ok (retire-offset token-id)))
+)
