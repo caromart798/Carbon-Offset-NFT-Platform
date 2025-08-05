@@ -6,6 +6,27 @@
 (define-data-var total-offsets-created uint u0)
 (define-data-var total-offsets-retired uint u0)
 
+(define-constant ERR-NOT-AUTHORIZED (err u401))
+(define-constant ERR-NOT-FOUND (err u404))
+(define-constant ERR-ALREADY-EXISTS (err u409))
+(define-constant ERR-INSUFFICIENT-FUNDS (err u402))
+(define-constant ERR-INVALID-AMOUNT (err u400))
+(define-constant ERR-ALREADY-RETIRED (err u410))
+(define-constant ERR-NOT-VERIFIED (err u403))
+(define-constant ERR-INSUFFICIENT-CREDITS (err u411))
+
+(define-constant ERR-BUNDLE-NOT-FOUND (err u450))
+(define-constant ERR-BUNDLE-INACTIVE (err u451))
+(define-constant ERR-BUNDLE-LIMIT-EXCEEDED (err u452))
+(define-constant ERR-BUNDLE-EMPTY (err u453))
+(define-constant ERR-NOT-BUNDLE-OWNER (err u454))
+
+(define-constant ERR-LEASE-NOT-FOUND (err u500))
+(define-constant ERR-LEASE-EXPIRED (err u501))
+(define-constant ERR-LEASE-ACTIVE (err u502))
+(define-constant ERR-INVALID-DURATION (err u503))
+(define-constant ERR-NOT-LESSEE (err u504))
+
 (define-map offset-details uint {
     project-id: (string-ascii 50),
     carbon-amount: uint,
@@ -40,14 +61,6 @@
     total-projects: uint
 })
 
-(define-constant ERR-NOT-AUTHORIZED (err u401))
-(define-constant ERR-NOT-FOUND (err u404))
-(define-constant ERR-ALREADY-EXISTS (err u409))
-(define-constant ERR-INSUFFICIENT-FUNDS (err u402))
-(define-constant ERR-INVALID-AMOUNT (err u400))
-(define-constant ERR-ALREADY-RETIRED (err u410))
-(define-constant ERR-NOT-VERIFIED (err u403))
-(define-constant ERR-INSUFFICIENT-CREDITS (err u411))
 
 (define-read-only (get-last-token-id)
     (var-get last-token-id)
@@ -271,12 +284,6 @@
 
 (define-map bundle-ownership uint principal)
 
-(define-constant ERR-BUNDLE-NOT-FOUND (err u450))
-(define-constant ERR-BUNDLE-INACTIVE (err u451))
-(define-constant ERR-BUNDLE-LIMIT-EXCEEDED (err u452))
-(define-constant ERR-BUNDLE-EMPTY (err u453))
-(define-constant ERR-NOT-BUNDLE-OWNER (err u454))
-
 (define-read-only (get-bundle-details (bundle-id uint))
     (map-get? bundle-registry bundle-id)
 )
@@ -419,4 +426,86 @@
 
 (define-private (retire-single-bundle-token (token-id uint) (acc bool))
     (and acc (is-ok (retire-offset token-id)))
+)
+
+(define-data-var last-lease-id uint u0)
+
+(define-map lease-registry uint {
+    token-id: uint,
+    lessor: principal,
+    lessee: principal,
+    start-block: uint,
+    end-block: uint,
+    lease-price: uint,
+    active: bool,
+    created-at: uint
+})
+
+(define-map active-leases uint uint)
+
+(define-read-only (get-lease-details (lease-id uint))
+    (map-get? lease-registry lease-id)
+)
+
+(define-read-only (get-token-lease (token-id uint))
+    (map-get? active-leases token-id)
+)
+
+(define-read-only (is-token-leased (token-id uint))
+    (match (map-get? active-leases token-id)
+        lease-id (match (map-get? lease-registry lease-id)
+            lease-info (and (get active lease-info) (>= (get end-block lease-info) stacks-block-height))
+            false
+        )
+        false
+    )
+)
+
+(define-public (create-lease (token-id uint) (duration uint) (lease-price uint))
+    (let (
+        (lease-id (+ (var-get last-lease-id) u1))
+        (token-owner (unwrap! (nft-get-owner? carbon-offset-nft token-id) ERR-NOT-FOUND))
+        (offset-info (unwrap! (map-get? offset-details token-id) ERR-NOT-FOUND))
+        (end-block (+ stacks-block-height duration))
+    )
+        (asserts! (is-eq tx-sender token-owner) ERR-NOT-AUTHORIZED)
+        (asserts! (not (get retired offset-info)) ERR-ALREADY-RETIRED)
+        (asserts! (not (is-token-leased token-id)) ERR-LEASE-ACTIVE)
+        (asserts! (> duration u0) ERR-INVALID-DURATION)
+        (asserts! (> lease-price u0) ERR-INVALID-AMOUNT)
+        
+        (map-set lease-registry lease-id {
+            token-id: token-id,
+            lessor: tx-sender,
+            lessee: tx-sender,
+            start-block: stacks-block-height,
+            end-block: end-block,
+            lease-price: lease-price,
+            active: false,
+            created-at: stacks-block-height
+        })
+        
+        (var-set last-lease-id lease-id)
+        (ok lease-id)
+    )
+)
+
+(define-public (accept-lease (lease-id uint))
+    (let (
+        (lease-info (unwrap! (map-get? lease-registry lease-id) ERR-LEASE-NOT-FOUND))
+        (fee (/ (* (get lease-price lease-info) (var-get platform-fee)) u10000))
+    )
+        (asserts! (not (is-eq tx-sender (get lessor lease-info))) ERR-NOT-AUTHORIZED)
+        (asserts! (not (get active lease-info)) ERR-LEASE-ACTIVE)
+        (asserts! (>= (get end-block lease-info) stacks-block-height) ERR-LEASE-EXPIRED)
+        
+        (try! (stx-transfer? (- (get lease-price lease-info) fee) tx-sender (get lessor lease-info)))
+        (try! (stx-transfer? fee tx-sender (var-get contract-owner)))
+        
+        (map-set lease-registry lease-id 
+            (merge lease-info {lessee: tx-sender, active: true})
+        )
+        (map-set active-leases (get token-id lease-info) lease-id)
+        (ok true)
+    )
 )
