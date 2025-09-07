@@ -509,3 +509,104 @@
         (ok true)
     )
 )
+
+(define-map user-reputation principal {
+    environmental-score: uint,
+    activity-level: uint,
+    total-impact: uint,
+    reputation-tier: uint,
+    last-updated: uint
+})
+
+(define-map verifier-reputation principal {
+    reliability-score: uint,
+    projects-verified: uint,
+    community-rating: uint,
+    verification-tier: uint,
+    last-active: uint
+})
+
+(define-read-only (get-user-reputation (user principal))
+    (default-to 
+        {environmental-score: u0, activity-level: u0, total-impact: u0, reputation-tier: u0, last-updated: u0}
+        (map-get? user-reputation user)
+    )
+)
+
+(define-read-only (get-verifier-reputation (verifier principal))
+    (default-to 
+        {reliability-score: u0, projects-verified: u0, community-rating: u0, verification-tier: u0, last-active: u0}
+        (map-get? verifier-reputation verifier)
+    )
+)
+
+(define-read-only (calculate-reputation-discount (user principal))
+    (let (
+        (user-rep (get-user-reputation user))
+        (tier (get reputation-tier user-rep))
+    )
+        (if (>= tier u4) u500
+            (if (>= tier u3) u300
+                (if (>= tier u2) u150
+                    (if (>= tier u1) u50 u0)
+                )
+            )
+        )
+    )
+)
+
+(define-private (update-user-reputation (user principal) (carbon-amount uint) (action-type uint))
+    (let (
+        (current-rep (get-user-reputation user))
+        (score-boost (if (is-eq action-type u1) (* carbon-amount u10) (* carbon-amount u20)))
+        (new-score (+ (get environmental-score current-rep) score-boost))
+        (new-activity (+ (get activity-level current-rep) u1))
+        (new-impact (+ (get total-impact current-rep) carbon-amount))
+        (new-tier (calculate-user-tier new-score new-activity))
+    )
+        (map-set user-reputation user {
+            environmental-score: new-score,
+            activity-level: new-activity,
+            total-impact: new-impact,
+            reputation-tier: new-tier,
+            last-updated: stacks-block-height
+        })
+    )
+)
+
+(define-private (update-verifier-reputation (verifier principal))
+    (let (
+        (current-rep (get-verifier-reputation verifier))
+        (new-projects (+ (get projects-verified current-rep) u1))
+        (new-score (+ (get reliability-score current-rep) u100))
+        (new-tier (calculate-verifier-tier new-score new-projects))
+    )
+        (map-set verifier-reputation verifier {
+            reliability-score: new-score,
+            projects-verified: new-projects,
+            community-rating: (get community-rating current-rep),
+            verification-tier: new-tier,
+            last-active: stacks-block-height
+        })
+    )
+)
+
+(define-private (calculate-user-tier (score uint) (activity uint))
+    (if (and (>= score u10000) (>= activity u50)) u4
+        (if (and (>= score u5000) (>= activity u25)) u3
+            (if (and (>= score u2000) (>= activity u10)) u2
+                (if (and (>= score u500) (>= activity u3)) u1 u0)
+            )
+        )
+    )
+)
+
+(define-private (calculate-verifier-tier (score uint) (projects uint))
+    (if (and (>= score u5000) (>= projects u20)) u4
+        (if (and (>= score u2500) (>= projects u10)) u3
+            (if (and (>= score u1000) (>= projects u5)) u2
+                (if (and (>= score u300) (>= projects u2)) u1 u0)
+            )
+        )
+    )
+)
