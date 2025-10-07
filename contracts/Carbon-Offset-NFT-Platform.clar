@@ -610,3 +610,97 @@
         )
     )
 )
+
+(define-data-var last-pool-id uint u0)
+
+(define-map carbon-pools uint {
+    name: (string-ascii 50),
+    target-amount: uint,
+    current-amount: uint,
+    target-token-id: uint,
+    creator: principal,
+    executed: bool,
+    contributor-count: uint,
+    created-at: uint
+})
+
+(define-map pool-contributions {pool-id: uint, contributor: principal} uint)
+
+(define-map pool-contributor-list uint (list 100 principal))
+
+(define-constant ERR-POOL-NOT-FOUND (err u600))
+(define-constant ERR-POOL-ALREADY-EXECUTED (err u601))
+(define-constant ERR-POOL-TARGET-NOT-MET (err u602))
+(define-constant ERR-POOL-FULL (err u603))
+
+(define-read-only (get-pool-details (pool-id uint))
+    (map-get? carbon-pools pool-id)
+)
+
+(define-read-only (get-pool-contribution (pool-id uint) (contributor principal))
+    (default-to u0 (map-get? pool-contributions {pool-id: pool-id, contributor: contributor}))
+)
+
+(define-public (create-carbon-pool (name (string-ascii 50)) (target-amount uint) (target-token-id uint))
+    (let (
+        (pool-id (+ (var-get last-pool-id) u1))
+    )
+        (asserts! (is-some (map-get? offset-details target-token-id)) ERR-NOT-FOUND)
+        (asserts! (> target-amount u0) ERR-INVALID-AMOUNT)
+        
+        (map-set carbon-pools pool-id {
+            name: name,
+            target-amount: target-amount,
+            current-amount: u0,
+            target-token-id: target-token-id,
+            creator: tx-sender,
+            executed: false,
+            contributor-count: u0,
+            created-at: stacks-block-height
+        })
+        
+        (map-set pool-contributor-list pool-id (list))
+        (var-set last-pool-id pool-id)
+        (ok pool-id)
+    )
+)
+
+(define-public (contribute-to-pool (pool-id uint) (amount uint))
+    (let (
+        (pool-info (unwrap! (map-get? carbon-pools pool-id) ERR-POOL-NOT-FOUND))
+        (current-contribution (get-pool-contribution pool-id tx-sender))
+        (new-total (+ (get current-amount pool-info) amount))
+    )
+        (asserts! (not (get executed pool-info)) ERR-POOL-ALREADY-EXECUTED)
+        (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+        
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        
+        (map-set pool-contributions {pool-id: pool-id, contributor: tx-sender} 
+            (+ current-contribution amount))
+        
+        (map-set carbon-pools pool-id 
+            (merge pool-info {
+                current-amount: new-total,
+                contributor-count: (if (is-eq current-contribution u0) 
+                    (+ (get contributor-count pool-info) u1)
+                    (get contributor-count pool-info))
+            }))
+        (ok true)
+    )
+)
+
+(define-public (execute-pool-purchase (pool-id uint) (token-id uint))
+    (let (
+        (pool-info (unwrap! (map-get? carbon-pools pool-id) ERR-POOL-NOT-FOUND))
+    )
+        (asserts! (not (get executed pool-info)) ERR-POOL-ALREADY-EXECUTED)
+        (asserts! (>= (get current-amount pool-info) (get target-amount pool-info)) ERR-POOL-TARGET-NOT-MET)
+        
+        (try! (as-contract (purchase-offset token-id)))
+        (try! (as-contract (retire-offset token-id)))
+        
+        (map-set carbon-pools pool-id (merge pool-info {executed: true}))
+        (ok true)
+    )
+)
