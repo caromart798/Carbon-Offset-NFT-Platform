@@ -704,3 +704,98 @@
         (ok true)
     )
 )
+
+(define-data-var last-fraction-id uint u0)
+
+(define-map fractional-offsets uint {
+    original-token-id: uint,
+    total-shares: uint,
+    available-shares: uint,
+    share-price: uint,
+    original-owner: principal,
+    fractionalized-at: uint,
+    active: bool
+})
+
+(define-map fraction-ownership {fraction-id: uint, owner: principal} uint)
+
+(define-constant ERR-FRACTION-NOT-FOUND (err u700))
+(define-constant ERR-INSUFFICIENT-SHARES (err u701))
+(define-constant ERR-FRACTION-INACTIVE (err u702))
+(define-constant ERR-NO-SHARES-OWNED (err u703))
+
+(define-read-only (get-fraction-details (fraction-id uint))
+    (map-get? fractional-offsets fraction-id)
+)
+
+(define-read-only (get-user-shares (fraction-id uint) (owner principal))
+    (default-to u0 (map-get? fraction-ownership {fraction-id: fraction-id, owner: owner}))
+)
+
+(define-read-only (get-last-fraction-id)
+    (var-get last-fraction-id)
+)
+
+(define-public (fractionalize-offset (token-id uint) (total-shares uint) (share-price uint))
+    (let (
+        (fraction-id (+ (var-get last-fraction-id) u1))
+        (token-owner (unwrap! (nft-get-owner? carbon-offset-nft token-id) ERR-NOT-FOUND))
+        (offset-info (unwrap! (map-get? offset-details token-id) ERR-NOT-FOUND))
+    )
+        (asserts! (is-eq tx-sender token-owner) ERR-NOT-AUTHORIZED)
+        (asserts! (not (get retired offset-info)) ERR-ALREADY-RETIRED)
+        (asserts! (> total-shares u1) ERR-INVALID-AMOUNT)
+        (asserts! (> share-price u0) ERR-INVALID-AMOUNT)
+        
+        (try! (nft-transfer? carbon-offset-nft token-id tx-sender (as-contract tx-sender)))
+        
+        (map-set fractional-offsets fraction-id {
+            original-token-id: token-id,
+            total-shares: total-shares,
+            available-shares: total-shares,
+            share-price: share-price,
+            original-owner: tx-sender,
+            fractionalized-at: stacks-block-height,
+            active: true
+        })
+        
+        (var-set last-fraction-id fraction-id)
+        (ok fraction-id)
+    )
+)
+
+(define-public (purchase-fraction (fraction-id uint) (shares uint))
+    (let (
+        (fraction-info (unwrap! (map-get? fractional-offsets fraction-id) ERR-FRACTION-NOT-FOUND))
+        (total-price (* shares (get share-price fraction-info)))
+        (current-shares (get-user-shares fraction-id tx-sender))
+        (fee (/ (* total-price (var-get platform-fee)) u10000))
+    )
+        (asserts! (get active fraction-info) ERR-FRACTION-INACTIVE)
+        (asserts! (>= (get available-shares fraction-info) shares) ERR-INSUFFICIENT-SHARES)
+        (asserts! (> shares u0) ERR-INVALID-AMOUNT)
+        
+        (try! (stx-transfer? (- total-price fee) tx-sender (get original-owner fraction-info)))
+        (try! (stx-transfer? fee tx-sender (var-get contract-owner)))
+        
+        (map-set fraction-ownership {fraction-id: fraction-id, owner: tx-sender} (+ current-shares shares))
+        (map-set fractional-offsets fraction-id 
+            (merge fraction-info {available-shares: (- (get available-shares fraction-info) shares)})
+        )
+        (ok true)
+    )
+)
+
+(define-public (retire-fraction (fraction-id uint) (shares uint))
+    (let (
+        (fraction-info (unwrap! (map-get? fractional-offsets fraction-id) ERR-FRACTION-NOT-FOUND))
+        (user-shares (get-user-shares fraction-id tx-sender))
+        (token-id (get original-token-id fraction-info))
+    )
+        (asserts! (>= user-shares shares) ERR-NO-SHARES-OWNED)
+        (asserts! (> shares u0) ERR-INVALID-AMOUNT)
+        
+        (map-set fraction-ownership {fraction-id: fraction-id, owner: tx-sender} (- user-shares shares))
+        (ok true)
+    )
+)
